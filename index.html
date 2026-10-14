@@ -1,0 +1,198 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+  <title>Trader</title>
+  <style>
+    html, body {
+      margin: 0; padding: 0; height: 100%; overflow: hidden;
+      background: #0b1426;
+      -webkit-user-select: none; user-select: none;
+      -webkit-tap-highlight-color: rgba(0,0,0,0);
+      overscroll-behavior: none;
+      font-family: "Segoe UI", Roboto, Arial, sans-serif;
+    }
+    #unity-canvas { position: fixed; inset: 0; width: 100%; height: 100%; display: block; background: #0b1426; }
+    #unity-canvas:focus { outline: none; }
+
+    .screen {
+      position: fixed; inset: 0; display: flex; flex-direction: column;
+      align-items: center; justify-content: center; gap: 22px; color: #e8edf7;
+      background: radial-gradient(ellipse at 70% 30%, #1d4a3a 0%, #0f2440 45%, #0b1426 100%);
+      text-align: center; padding: 16px; box-sizing: border-box;
+    }
+    .logo {
+      font-size: clamp(44px, 9vw, 96px); font-weight: 900; letter-spacing: 0.06em;
+      background: linear-gradient(180deg, #ffffff 0%, #b8f5c8 100%);
+      -webkit-background-clip: text; background-clip: text; color: transparent;
+      text-shadow: 0 0 40px rgba(80, 255, 140, 0.25);
+    }
+    .bar { width: min(420px, 70vw); height: 12px; border-radius: 6px; background: rgba(255,255,255,0.12); overflow: hidden; }
+    .bar > div { height: 100%; width: 0%; border-radius: 6px; background: linear-gradient(90deg, #2ecc71, #ffd24a); transition: width .2s; }
+    .hint { font-size: 16px; color: #9aa6bc; }
+    .btn {
+      font-size: 18px; font-weight: 700; color: #fff; background: #17a34a; border: 0; border-radius: 10px;
+      padding: 12px 28px; cursor: pointer;
+    }
+    .btn:hover { background: #1db954; }
+    [hidden] { display: none !important; }
+  </style>
+</head>
+<body>
+  <canvas id="unity-canvas" tabindex="-1"></canvas>
+
+  <div id="loading" class="screen">
+    <div class="logo">TRADER</div>
+    <div class="bar"><div id="progress"></div></div>
+    <div class="hint" id="loading-hint">Загрузка...</div>
+  </div>
+
+  <div id="other-tab" class="screen" hidden>
+    <div class="logo">TRADER</div>
+    <div class="hint">Игра уже открыта в другой вкладке.</div>
+    <button class="btn" id="play-here">Играть здесь</button>
+  </div>
+
+  <div id="error" class="screen" hidden>
+    <div class="logo">TRADER</div>
+    <div class="hint" id="error-text">Не удалось запустить игру. Обновите страницу.</div>
+  </div>
+
+  <!-- JS API VK Play: работает только внутри страницы игры на vkplay.ru -->
+  <script src="https://vkplay.ru/app/50719/static/mailru.core.js"></script>
+
+  <script>
+    (function () {
+      document.addEventListener('contextmenu', function (e) { e.preventDefault(); });
+
+      var canvas = document.getElementById('unity-canvas');
+      var loading = document.getElementById('loading');
+      var progress = document.getElementById('progress');
+      var otherTab = document.getElementById('other-tab');
+      var unityInstance = null;
+      var started = false;
+
+      // ───── Одна вкладка: игра не запускается параллельно в нескольких вкладках ─────
+      var TAB_KEY = 'trader_vk_active_tab';
+      var tabId = Date.now() + '_' + Math.random().toString(36).slice(2);
+      var channel = ('BroadcastChannel' in window) ? new BroadcastChannel('trader_vk_tabs') : null;
+      var heartbeat = null;
+
+      function readLock() {
+        try { return JSON.parse(localStorage.getItem(TAB_KEY) || 'null'); } catch (e) { return null; }
+      }
+      function writeLock() {
+        try { localStorage.setItem(TAB_KEY, JSON.stringify({ id: tabId, t: Date.now() })); } catch (e) {}
+      }
+      function otherTabAlive() {
+        var lock = readLock();
+        return lock && lock.id !== tabId && (Date.now() - lock.t) < 4000;
+      }
+      function takeLock() {
+        writeLock();
+        if (heartbeat) clearInterval(heartbeat);
+        heartbeat = setInterval(function () {
+          var lock = readLock();
+          if (lock && lock.id !== tabId && (Date.now() - lock.t) < 4000) { yieldToOtherTab(); return; }
+          writeLock();
+        }, 1500);
+        if (channel) channel.postMessage({ type: 'takeover', id: tabId });
+      }
+      function yieldToOtherTab() {
+        if (heartbeat) { clearInterval(heartbeat); heartbeat = null; }
+        if (unityInstance) { try { unityInstance.Quit(); } catch (e) {} unityInstance = null; }
+        canvas.hidden = true;
+        loading.hidden = true;
+        otherTab.hidden = false;
+      }
+      if (channel) channel.onmessage = function (e) {
+        if (e.data && e.data.type === 'takeover' && e.data.id !== tabId && started) yieldToOtherTab();
+      };
+      window.addEventListener('beforeunload', function () {
+        var lock = readLock();
+        if (lock && lock.id === tabId) { try { localStorage.removeItem(TAB_KEY); } catch (e) {} }
+      });
+      document.getElementById('play-here').addEventListener('click', function () { location.reload(); });
+
+      // ───── VK Play JS API: незаметная регистрация игрока в игре ─────
+      var vkApi = null;
+      function initVkApi() {
+        if (typeof window.iframeApi === 'undefined') return;   // игра открыта не на vkplay.ru
+        var callbacks = {
+          appid: 50719,
+          getLoginStatusCallback: function (res) {
+            // 1 — вошёл на платформу, но ещё не зарегистрирован в игре
+            var st = typeof res === 'number' ? res : (res && res.loginStatus !== undefined ? Number(res.loginStatus) : -1);
+            if (st === 1 && !sessionStorage.getItem('trader_vk_reg')) {
+              sessionStorage.setItem('trader_vk_reg', '1');
+              vkApi.registerUser();
+            }
+          },
+          registerUserCallback: function () {},
+          userInfoCallback: function () {},
+          userProfileCallback: function () {},
+          paymentFrameUrlCallback: function () {},
+          getAuthTokenCallback: function () {},
+          paymentReceivedCallback: function () {},
+          paymentWindowClosedCallback: function () {},
+          userConfirmCallback: function () {},
+          paymentFrameItem: function () {},
+          getGameInventoryItems: function () {}
+        };
+        window.iframeApi(callbacks).then(function (api) {
+          vkApi = api;
+          window.vkPlayApi = api;
+          try { api.getLoginStatus(); } catch (e) {}
+        }, function (err) { console.log('VK Play API:', err); });
+      }
+
+      // ───── Unity ─────
+      function startUnity() {
+        started = true;
+        takeLock();
+        var buildUrl = 'Build';
+        var config = {
+          dataUrl: buildUrl + '/Trader_VK_Build.data.unityweb',
+          frameworkUrl: buildUrl + '/Trader_VK_Build.framework.js.unityweb',
+          codeUrl: buildUrl + '/Trader_VK_Build.wasm.unityweb',
+          streamingAssetsUrl: 'StreamingAssets',
+          companyName: "Kazatrix",
+          productName: "Trader",
+          productVersion: "1.0",
+          showBanner: function (msg, type) { if (type === 'error') console.error(msg); else console.warn(msg); }
+        };
+        if (/iPhone|iPad|iPod|Android/i.test(navigator.userAgent)) config.devicePixelRatio = Math.min(window.devicePixelRatio || 1, 2);
+
+        var script = document.createElement('script');
+        script.src = buildUrl + '/Trader_VK_Build.loader.js';
+        script.onload = function () {
+          createUnityInstance(canvas, config, function (p) {
+            progress.style.width = Math.round(p * 100) + '%';
+          }).then(function (instance) {
+            unityInstance = instance;
+            loading.hidden = true;
+            canvas.focus();
+          }).catch(function (message) {
+            console.error(message);
+            loading.hidden = true;
+            document.getElementById('error').hidden = false;
+          });
+        };
+        document.body.appendChild(script);
+      }
+
+      initVkApi();
+      if (otherTabAlive()) {
+        loading.hidden = true;
+        canvas.hidden = true;
+        otherTab.hidden = false;
+      } else {
+        startUnity();
+      }
+
+      window.addEventListener('pointerdown', function () { canvas.focus(); });
+    })();
+  </script>
+</body>
+</html>
